@@ -133,10 +133,13 @@ class Block(nn.Module):
 
 # standard GOPT model proposed in the paper
 class GOPT(nn.Module):
-    def __init__(self, embed_dim, num_heads, depth, input_dim=84):
+    def __init__(self, embed_dim, num_heads, depth, input_dim=84, extra_dim=0, use_extra_gating=False, gate_dropout=0.1):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        self.extra_dim = extra_dim
+        self.use_extra_gating = use_extra_gating and extra_dim > 0
+        head_dim = embed_dim + extra_dim
         # Transformer encode blocks
         self.blocks = nn.ModuleList([Block(dim=embed_dim, num_heads=num_heads) for i in range(depth)])
 
@@ -147,27 +150,32 @@ class GOPT(nn.Module):
 
         # for phone classification
         self.in_proj = nn.Linear(self.input_dim, embed_dim)
-        self.mlp_head_phn = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_phn = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
         # for word classification, 1=accuracy, 2=stress, 3=total
-        self.mlp_head_word1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_word2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_word1 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_word2 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
         # canonical phone projection, assume there are 40 phns
         self.phn_proj = nn.Linear(40, embed_dim)
 
+        if self.use_extra_gating:
+            self.extra_gate_hidden = nn.Linear(embed_dim, extra_dim)
+            self.extra_gate_extra = nn.Linear(extra_dim, extra_dim)
+            self.extra_gate_drop = nn.Dropout(gate_dropout)
+
         # utterance level, 1=accuracy, 2=completeness, 3=fluency, 4=prosodic, 5=total score
         self.cls_token1 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt1 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
         self.cls_token2 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt2 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
         self.cls_token3 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt3 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
         self.cls_token4 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt4 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt4 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
         self.cls_token5 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt5 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt5 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
         # initialize the cls tokens
         trunc_normal_(self.cls_token1, std=.02)
@@ -178,7 +186,7 @@ class GOPT(nn.Module):
 
     # x shape in [batch_size, sequence_len, feat_dim]
     # phn in [batch_size, seq_len]
-    def forward(self, x, phn):
+    def forward(self, x, phn, extra_feat=None):
 
         # batch size
         B = x.shape[0]
@@ -208,29 +216,52 @@ class GOPT(nn.Module):
         for blk in self.blocks:
             x = blk(x)
 
+        def fuse_hidden(hidden, extra):
+            if self.extra_dim == 0:
+                return hidden
+            if extra is None:
+                raise ValueError('extra_feat is required when extra_dim > 0')
+            if self.use_extra_gating:
+                if hidden.dim() == 2:
+                    gate = torch.sigmoid(self.extra_gate_hidden(hidden) + self.extra_gate_extra(extra))
+                    extra = self.extra_gate_drop(gate * extra)
+                else:
+                    extra_expand = extra.unsqueeze(1).repeat(1, hidden.shape[1], 1)
+                    gate = torch.sigmoid(self.extra_gate_hidden(hidden) + self.extra_gate_extra(extra_expand))
+                    extra = self.extra_gate_drop(gate * extra_expand)
+                    return torch.cat((hidden, extra), dim=2)
+            if hidden.dim() == 2:
+                return torch.cat((hidden, extra), dim=1)
+            extra_expand = extra.unsqueeze(1).repeat(1, hidden.shape[1], 1)
+            return torch.cat((hidden, extra_expand), dim=2)
+
         # the first 5 tokens are utterance-level cls tokens, i.e., accuracy, completeness, fluency, prosodic, total scores
-        u1 = self.mlp_head_utt1(x[:, 0])
-        u2 = self.mlp_head_utt2(x[:, 1])
-        u3 = self.mlp_head_utt3(x[:, 2])
-        u4 = self.mlp_head_utt4(x[:, 3])
-        u5 = self.mlp_head_utt5(x[:, 4])
+        u1 = self.mlp_head_utt1(fuse_hidden(x[:, 0], extra_feat))
+        u2 = self.mlp_head_utt2(fuse_hidden(x[:, 1], extra_feat))
+        u3 = self.mlp_head_utt3(fuse_hidden(x[:, 2], extra_feat))
+        u4 = self.mlp_head_utt4(fuse_hidden(x[:, 3], extra_feat))
+        u5 = self.mlp_head_utt5(fuse_hidden(x[:, 4], extra_feat))
 
         # 6th-end tokens are phone score tokens
-        p = self.mlp_head_phn(x[:, 5:])
+        token_hidden = fuse_hidden(x[:, 5:], extra_feat)
+        p = self.mlp_head_phn(token_hidden)
 
         # word score is propagated to phone-level, so word output is also at phone-level.
         # but different mlp heads are used, 1 = accuracy, 2 = stress, 3 = total
-        w1 = self.mlp_head_word1(x[:, 5:])
-        w2 = self.mlp_head_word2(x[:, 5:])
-        w3 = self.mlp_head_word3(x[:, 5:])
+        w1 = self.mlp_head_word1(token_hidden)
+        w2 = self.mlp_head_word2(token_hidden)
+        w3 = self.mlp_head_word3(token_hidden)
         return u1, u2, u3, u4, u5, p, w1, w2, w3
 
 # GOPT model without canonical phone embedding, performance worse than standard GOPT model
 class GOPTNoPhn(nn.Module):
-    def __init__(self, embed_dim, num_heads, depth, input_dim=84):
+    def __init__(self, embed_dim, num_heads, depth, input_dim=84, extra_dim=0, use_extra_gating=False, gate_dropout=0.1):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        self.extra_dim = extra_dim
+        self.use_extra_gating = use_extra_gating and extra_dim > 0
+        head_dim = embed_dim + extra_dim
         self.blocks = nn.ModuleList([Block(dim=embed_dim, num_heads=num_heads) for i in range(depth)])
 
         # sin pos embedding
@@ -240,27 +271,32 @@ class GOPTNoPhn(nn.Module):
 
         # for phone classification
         self.in_proj = nn.Linear(self.input_dim, embed_dim)
-        self.mlp_head_phn = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_phn = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
         # for word classification
-        self.mlp_head_word1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_word2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_word1 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_word2 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
         # phone projection
         self.phn_proj = nn.Linear(40, embed_dim)
 
+        if self.use_extra_gating:
+            self.extra_gate_hidden = nn.Linear(embed_dim, extra_dim)
+            self.extra_gate_extra = nn.Linear(extra_dim, extra_dim)
+            self.extra_gate_drop = nn.Dropout(gate_dropout)
+
         # utterance level
         self.cls_token1 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt1 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
         self.cls_token2 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt2 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
         self.cls_token3 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt3 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
         self.cls_token4 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt4 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt4 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
         self.cls_token5 = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.mlp_head_utt5 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt5 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
         # initialize the cls tokens
         trunc_normal_(self.cls_token1, std=.02)
@@ -271,7 +307,7 @@ class GOPTNoPhn(nn.Module):
 
     # x shape in [batch_size, sequence_len, feat_dim]
     # phn in [batch_size, seq_len]
-    def forward(self, x, phn):
+    def forward(self, x, phn, extra_feat=None):
 
         # batch size
         B = x.shape[0]
@@ -299,14 +335,34 @@ class GOPTNoPhn(nn.Module):
         for blk in self.blocks:
             x = blk(x)
 
-        u1 = self.mlp_head_utt1(x[:, 0])
-        u2 = self.mlp_head_utt2(x[:, 1])
-        u3 = self.mlp_head_utt3(x[:, 2])
-        u4 = self.mlp_head_utt4(x[:, 3])
-        u5 = self.mlp_head_utt5(x[:, 4])
+        def fuse_hidden(hidden, extra):
+            if self.extra_dim == 0:
+                return hidden
+            if extra is None:
+                raise ValueError('extra_feat is required when extra_dim > 0')
+            if self.use_extra_gating:
+                if hidden.dim() == 2:
+                    gate = torch.sigmoid(self.extra_gate_hidden(hidden) + self.extra_gate_extra(extra))
+                    extra = self.extra_gate_drop(gate * extra)
+                else:
+                    extra_expand = extra.unsqueeze(1).repeat(1, hidden.shape[1], 1)
+                    gate = torch.sigmoid(self.extra_gate_hidden(hidden) + self.extra_gate_extra(extra_expand))
+                    extra = self.extra_gate_drop(gate * extra_expand)
+                    return torch.cat((hidden, extra), dim=2)
+            if hidden.dim() == 2:
+                return torch.cat((hidden, extra), dim=1)
+            extra_expand = extra.unsqueeze(1).repeat(1, hidden.shape[1], 1)
+            return torch.cat((hidden, extra_expand), dim=2)
 
-        p = self.mlp_head_phn(x[:, 5:])
-        w1 = self.mlp_head_word1(x[:, 5:])
-        w2 = self.mlp_head_word2(x[:, 5:])
-        w3 = self.mlp_head_word3(x[:, 5:])
+        u1 = self.mlp_head_utt1(fuse_hidden(x[:, 0], extra_feat))
+        u2 = self.mlp_head_utt2(fuse_hidden(x[:, 1], extra_feat))
+        u3 = self.mlp_head_utt3(fuse_hidden(x[:, 2], extra_feat))
+        u4 = self.mlp_head_utt4(fuse_hidden(x[:, 3], extra_feat))
+        u5 = self.mlp_head_utt5(fuse_hidden(x[:, 4], extra_feat))
+
+        token_hidden = fuse_hidden(x[:, 5:], extra_feat)
+        p = self.mlp_head_phn(token_hidden)
+        w1 = self.mlp_head_word1(token_hidden)
+        w2 = self.mlp_head_word2(token_hidden)
+        w3 = self.mlp_head_word3(token_hidden)
         return u1, u2, u3, u4, u5, p, w1, w2, w3

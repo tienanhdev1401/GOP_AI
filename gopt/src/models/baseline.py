@@ -12,30 +12,32 @@ import torch.nn as nn
 import numpy as np
 
 class BaselineLSTM(nn.Module):
-    def __init__(self, embed_dim, depth, input_dim=84):
+    def __init__(self, embed_dim, depth, input_dim=84, extra_dim=0):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        self.extra_dim = extra_dim
+        head_dim = embed_dim + extra_dim
         self.lstm = torch.nn.LSTM(input_size=embed_dim, hidden_size=embed_dim, num_layers=depth, batch_first=True)
 
         # for phone classification
         self.in_proj = nn.Linear(self.input_dim, embed_dim)
-        self.mlp_head_phn = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_phn = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
         # for word classification
-        self.mlp_head_word1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_word2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_word1 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_word2 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_word3 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
         # phone projection
         self.phn_proj = nn.Linear(40, embed_dim)
 
         # utterance level
-        self.mlp_head_utt1 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_utt2 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_utt3 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_utt4 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-        self.mlp_head_utt5 = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        self.mlp_head_utt1 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_utt2 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_utt3 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_utt4 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
+        self.mlp_head_utt5 = nn.Sequential(nn.LayerNorm(head_dim), nn.Linear(head_dim, 1))
 
     # get the output of the last valid token
     def get_last_valid(self, input, mask):
@@ -55,7 +57,7 @@ class BaselineLSTM(nn.Module):
 
     # x shape in [batch_size, sequence_len, feat_dim]
     # phn in [batch_size, seq_len]
-    def forward(self, x, phn):
+    def forward(self, x, phn, extra_feat=None):
 
         # batch size
         B = x.shape[0]
@@ -74,16 +76,28 @@ class BaselineLSTM(nn.Module):
 
         x = self.lstm(x)[0]
 
-        p = self.mlp_head_phn(x).reshape(B, seq_len, 1)
+        def fuse_hidden(hidden, extra):
+            if self.extra_dim == 0:
+                return hidden
+            if extra is None:
+                raise ValueError('extra_feat is required when extra_dim > 0')
+            if hidden.dim() == 2:
+                return torch.cat((hidden, extra), dim=1)
+            extra_expand = extra.unsqueeze(1).repeat(1, hidden.shape[1], 1)
+            return torch.cat((hidden, extra_expand), dim=2)
 
-        w1 = self.mlp_head_word1(x).reshape(B, seq_len, 1)
-        w2 = self.mlp_head_word2(x).reshape(B, seq_len, 1)
-        w3 = self.mlp_head_word3(x).reshape(B, seq_len, 1)
+        token_hidden = fuse_hidden(x, extra_feat)
 
-        u1 = self.get_last_valid(self.mlp_head_utt1(x).reshape(B, seq_len), valid_tok_mask)
-        u2 = self.get_last_valid(self.mlp_head_utt2(x).reshape(B, seq_len), valid_tok_mask)
-        u3 = self.get_last_valid(self.mlp_head_utt3(x).reshape(B, seq_len), valid_tok_mask)
-        u4 = self.get_last_valid(self.mlp_head_utt4(x).reshape(B, seq_len), valid_tok_mask)
-        u5 = self.get_last_valid(self.mlp_head_utt5(x).reshape(B, seq_len), valid_tok_mask)
+        p = self.mlp_head_phn(token_hidden).reshape(B, seq_len, 1)
+
+        w1 = self.mlp_head_word1(token_hidden).reshape(B, seq_len, 1)
+        w2 = self.mlp_head_word2(token_hidden).reshape(B, seq_len, 1)
+        w3 = self.mlp_head_word3(token_hidden).reshape(B, seq_len, 1)
+
+        u1 = self.get_last_valid(self.mlp_head_utt1(token_hidden).reshape(B, seq_len), valid_tok_mask)
+        u2 = self.get_last_valid(self.mlp_head_utt2(token_hidden).reshape(B, seq_len), valid_tok_mask)
+        u3 = self.get_last_valid(self.mlp_head_utt3(token_hidden).reshape(B, seq_len), valid_tok_mask)
+        u4 = self.get_last_valid(self.mlp_head_utt4(token_hidden).reshape(B, seq_len), valid_tok_mask)
+        u5 = self.get_last_valid(self.mlp_head_utt5(token_hidden).reshape(B, seq_len), valid_tok_mask)
 
         return u1, u2, u3, u4, u5, p, w1, w2, w3

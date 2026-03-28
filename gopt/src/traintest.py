@@ -33,6 +33,10 @@ parser.add_argument("--am", type=str, default='librispeech', help="name of the a
 parser.add_argument("--noise", type=float, default=0., help="the scale of random noise added on the input GoP feature")
 parser.add_argument("--use_worstk_feat", action='store_true', help="append global stats (mean, std, worst-k GOP proxy) to each valid token")
 parser.add_argument("--worst_k", type=int, default=3, help="number of worst GOP proxy tokens used for extra features")
+parser.add_argument("--use_extra_gating", action='store_true', help="use learnable gating for late-fused global features")
+parser.add_argument("--gate_dropout", type=float, default=0.1, help="dropout applied on gated global features")
+parser.add_argument("--use_weighted_loss", action='store_true', help="use error-aware weighted MSE for phone and word losses")
+parser.add_argument("--weighted_alpha", type=float, default=1.0, help="weight strength for low-score targets in weighted loss")
 
 # just to generate the header for the result.csv
 def gen_result_header():
@@ -49,6 +53,15 @@ def gen_result_header():
     header = phn_header + utt_header + word_header
     return header
 
+def weighted_mse(pred, target, mask=None, alpha=1.0):
+    target_clip = torch.clamp(target, 0.0, 2.0)
+    weights = 1.0 + alpha * (2.0 - target_clip) / 2.0
+    if mask is not None:
+        weights = weights * mask.float()
+    loss = ((pred - target) ** 2) * weights
+    denom = torch.sum(weights) + 1e-8
+    return torch.sum(loss) / denom
+
 def train(audio_model, train_loader, test_loader, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print('running on ' + str(device))
@@ -57,6 +70,7 @@ def train(audio_model, train_loader, test_loader, args):
     best_epoch, best_mse = 0, 999
     global_step, epoch = 0, 0
     exp_dir = args.exp_dir
+    os.makedirs(exp_dir, exist_ok=True)
 
     if not isinstance(audio_model, nn.DataParallel):
         audio_model = nn.DataParallel(audio_model)
@@ -78,12 +92,13 @@ def train(audio_model, train_loader, test_loader, args):
 
     while epoch < args.n_epochs:
         audio_model.train()
-        for i, (audio_input, phn_label, phns, utt_label, word_label) in enumerate(train_loader):
+        for i, (audio_input, phn_label, phns, utt_label, word_label, extra_feat) in enumerate(train_loader):
 
             audio_input = audio_input.to(device, non_blocking=True)
             phn_label = phn_label.to(device, non_blocking=True)
             utt_label = utt_label.to(device, non_blocking=True)
             word_label = word_label.to(device, non_blocking=True)
+            extra_feat = extra_feat.to(device, non_blocking=True)
 
             # warmup
             warm_up_step = 100
@@ -99,7 +114,7 @@ def train(audio_model, train_loader, test_loader, args):
             audio_input = audio_input + noise
 
             #print(phns.shape)
-            u1, u2, u3, u4, u5, p, w1, w2, w3 = audio_model(audio_input, phns)
+            u1, u2, u3, u4, u5, p, w1, w2, w3 = audio_model(audio_input, phns, extra_feat)
 
             # filter out the padded tokens, only calculate the loss based on the valid tokens
             # < 0 is a flag of padded tokens
@@ -108,10 +123,13 @@ def train(audio_model, train_loader, test_loader, args):
             p = p * mask
             phn_label = phn_label * mask
 
-            loss_phn = loss_fn(p, phn_label)
+            if args.use_weighted_loss:
+                loss_phn = weighted_mse(p, phn_label, mask=mask, alpha=args.weighted_alpha)
+            else:
+                loss_phn = loss_fn(p, phn_label)
 
-            # avoid the 0 losses of the padded tokens impacting the performance
-            loss_phn = loss_phn * (mask.shape[0] * mask.shape[1]) / torch.sum(mask)
+                # avoid the 0 losses of the padded tokens impacting the performance
+                loss_phn = loss_phn * (mask.shape[0] * mask.shape[1]) / torch.sum(mask)
 
             # utterance level loss, also mse
             utt_preds = torch.cat((u1, u2, u3, u4, u5), dim=1)
@@ -123,8 +141,11 @@ def train(audio_model, train_loader, test_loader, args):
             word_pred = torch.cat((w1,w2,w3), dim=2)
             word_pred = word_pred * mask
             word_label = word_label * mask
-            loss_word = loss_fn(word_pred, word_label)
-            loss_word = loss_word * (mask.shape[0] * mask.shape[1] * mask.shape[2]) / torch.sum(mask)
+            if args.use_weighted_loss:
+                loss_word = weighted_mse(word_pred, word_label, mask=mask, alpha=args.weighted_alpha)
+            else:
+                loss_word = loss_fn(word_pred, word_label)
+                loss_word = loss_word * (mask.shape[0] * mask.shape[1] * mask.shape[2]) / torch.sum(mask)
 
             loss = args.loss_w_phn * loss_phn + args.loss_w_utt * loss_utt + args.loss_w_word * loss_word
 
@@ -159,8 +180,7 @@ def train(audio_model, train_loader, test_loader, args):
             best_epoch = epoch
 
         if best_epoch == epoch:
-            if os.path.exists("%s/models/" % (exp_dir)) == False:
-                os.mkdir("%s/models" % (exp_dir))
+            os.makedirs("%s/models" % (exp_dir), exist_ok=True)
             torch.save(audio_model.state_dict(), "%s/models/best_audio_model.pth" % (exp_dir))
 
         if global_step > warm_up_step:
@@ -180,11 +200,12 @@ def validate(audio_model, val_loader, args, best_mse):
     A_u1, A_u2, A_u3, A_u4, A_u5, A_utt_target = [], [], [], [], [], []
     A_w1, A_w2, A_w3, A_word_target = [], [], [], []
     with torch.no_grad():
-        for i, (audio_input, phn_label, phns, utt_label, word_label) in enumerate(val_loader):
+        for i, (audio_input, phn_label, phns, utt_label, word_label, extra_feat) in enumerate(val_loader):
             audio_input = audio_input.to(device)
+            extra_feat = extra_feat.to(device)
 
             # compute output
-            u1, u2, u3, u4, u5, p, w1, w2, w3 = audio_model(audio_input, phns)
+            u1, u2, u3, u4, u5, p, w1, w2, w3 = audio_model(audio_input, phns, extra_feat)
             p = p.to('cpu').detach()
             u1, u2, u3, u4, u5 = u1.to('cpu').detach(), u2.to('cpu').detach(), u3.to('cpu').detach(), u4.to('cpu').detach(), u5.to('cpu').detach()
             w1, w2, w3 = w1.to('cpu').detach(), w2.to('cpu').detach(), w3.to('cpu').detach()
@@ -226,8 +247,7 @@ def validate(audio_model, val_loader, args, best_mse):
             print('new best phn mse {:.3f}, now saving predictions.'.format(phn_mse))
 
             # create the directory
-            if os.path.exists(args.exp_dir + '/preds') == False:
-                os.mkdir(args.exp_dir + '/preds')
+            os.makedirs(args.exp_dir + '/preds', exist_ok=True)
 
             # saving the phn target, only do once
             if os.path.exists(args.exp_dir + '/preds/phn_target.npy') == False:
@@ -344,7 +364,10 @@ class GoPDataset(Dataset):
         self.feat = self.norm_valid(self.feat, norm_mean, norm_std)
 
         if use_worstk_feat:
-            self.feat = self.add_worstk_feature(self.feat, self.phn_label, worst_k)
+            self.extra_feat = self.gen_worstk_feature(self.feat, self.phn_label, worst_k)
+        else:
+            # keep a placeholder tensor for consistent dataloader output.
+            self.extra_feat = torch.zeros([self.feat.shape[0], 1], dtype=self.feat.dtype)
 
         # normalize the utt_label to 0-2 (same with phn score range)
         self.utt_label = self.utt_label / 5
@@ -363,12 +386,12 @@ class GoPDataset(Dataset):
                     break
         return norm_feat
 
-    def add_worstk_feature(self, feat, phn_label, worst_k):
+    def gen_worstk_feature(self, feat, phn_label, worst_k):
         if worst_k <= 0:
             raise ValueError('worst_k must be positive when use_worstk_feat is enabled.')
 
         extra_dim = worst_k + 2
-        extra_feat = torch.zeros([feat.shape[0], feat.shape[1], extra_dim], dtype=feat.dtype)
+        extra_feat = torch.zeros([feat.shape[0], extra_dim], dtype=feat.dtype)
 
         for i in range(feat.shape[0]):
             valid_mask = phn_label[i, :, 0] >= 0
@@ -388,16 +411,16 @@ class GoPDataset(Dataset):
                 worst = torch.cat((worst, pad), dim=0)
 
             cur_extra = torch.cat((seq_mean.unsqueeze(0), seq_std.unsqueeze(0), worst), dim=0)
-            extra_feat[i, valid_mask, :] = cur_extra.unsqueeze(0).repeat(valid_len, 1)
+            extra_feat[i, :] = cur_extra
 
-        return torch.cat((feat, extra_feat), dim=2)
+        return extra_feat
 
     def __len__(self):
         return self.feat.shape[0]
 
     def __getitem__(self, idx):
         # feat, phn_label, phn_id, utt_label, word_label
-        return self.feat[idx, :], self.phn_label[idx, :, 1], self.phn_label[idx, :, 0], self.utt_label[idx, :], self.word_label[idx, :]
+        return self.feat[idx, :], self.phn_label[idx, :, 1], self.phn_label[idx, :, 0], self.utt_label[idx, :], self.word_label[idx, :], self.extra_feat[idx, :]
 
 args = parser.parse_args()
 
@@ -405,20 +428,19 @@ am = args.am
 print('now train with {:s} acoustic models'.format(am))
 feat_dim = {'librispeech':84, 'paiia':86, 'paiib': 88}
 input_dim = feat_dim[am]
-if args.use_worstk_feat:
-    input_dim = input_dim + args.worst_k + 2
+extra_dim = args.worst_k + 2 if args.use_worstk_feat else 0
 
 # nowa is the best models used in this work
 if args.model == 'gopt':
     print('now train a GOPT models')
-    audio_mdl = GOPT(embed_dim=args.embed_dim, num_heads=args.goptheads, depth=args.goptdepth, input_dim=input_dim)
+    audio_mdl = GOPT(embed_dim=args.embed_dim, num_heads=args.goptheads, depth=args.goptdepth, input_dim=input_dim, extra_dim=extra_dim, use_extra_gating=args.use_extra_gating, gate_dropout=args.gate_dropout)
 # for ablation study only
 elif args.model == 'gopt_nophn':
     print('now train a GOPT models without canonical phone embedding')
-    audio_mdl = GOPTNoPhn(embed_dim=args.embed_dim, num_heads=args.goptheads, depth=args.goptdepth, input_dim=input_dim)
+    audio_mdl = GOPTNoPhn(embed_dim=args.embed_dim, num_heads=args.goptheads, depth=args.goptdepth, input_dim=input_dim, extra_dim=extra_dim, use_extra_gating=args.use_extra_gating, gate_dropout=args.gate_dropout)
 elif args.model == 'lstm':
     print('now train a baseline LSTM model')
-    audio_mdl = BaselineLSTM(embed_dim=args.embed_dim, depth=args.goptdepth, input_dim=input_dim)
+    audio_mdl = BaselineLSTM(embed_dim=args.embed_dim, depth=args.goptdepth, input_dim=input_dim, extra_dim=extra_dim)
 
 tr_dataset = GoPDataset('train', am=am, use_worstk_feat=args.use_worstk_feat, worst_k=args.worst_k)
 tr_dataloader = DataLoader(tr_dataset, batch_size=args.batch_size, shuffle=True)
